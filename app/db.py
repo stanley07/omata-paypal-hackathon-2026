@@ -31,8 +31,33 @@ CREATE TABLE IF NOT EXISTS audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, merchant_id TEXT NOT NULL,
  order_id TEXT, event TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS webhook_events (id TEXT PRIMARY KEY, event_type TEXT NOT NULL, processed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS whatsapp_messages (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL REFERENCES merchants(id),
+ sender TEXT NOT NULL, received REAL NOT NULL, media_id TEXT NOT NULL,
+ transcript TEXT, order_id TEXT UNIQUE REFERENCES orders(id),
+ lease_until REAL NOT NULL DEFAULT 0, failure TEXT,
+ claim_token TEXT, phone_id TEXT,
+ share_state TEXT NOT NULL DEFAULT 'READY', outbound_id TEXT);
 CREATE INDEX IF NOT EXISTS orders_merchant ON orders(merchant_id,created_at);
 CREATE INDEX IF NOT EXISTS audit_merchant ON audit(merchant_id,id);
+CREATE TABLE IF NOT EXISTS catalog_products (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL REFERENCES merchants(id),
+ name TEXT NOT NULL, category TEXT NOT NULL, price_cents INTEGER NOT NULL CHECK(price_cents>0),
+ stock INTEGER NOT NULL CHECK(stock>=0), active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS shopping_sessions (
+ phone_id TEXT NOT NULL, sender TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'NEW',
+ offers TEXT NOT NULL DEFAULT '[]', quantity INTEGER NOT NULL DEFAULT 1,
+ selected TEXT, confirmation TEXT, expires REAL NOT NULL DEFAULT 0,
+ order_id TEXT REFERENCES orders(id), lease_until REAL NOT NULL DEFAULT 0, claim_token TEXT,
+ PRIMARY KEY(phone_id,sender));
+CREATE TABLE IF NOT EXISTS shopping_messages (
+ id TEXT PRIMARY KEY, phone_id TEXT NOT NULL, sender TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ received REAL NOT NULL, transcript TEXT, response TEXT, send_state TEXT NOT NULL DEFAULT 'NEW',
+ outbound_id TEXT, work_order_id TEXT REFERENCES orders(id), work_action TEXT);
+CREATE TABLE IF NOT EXISTS shopping_reviews (
+ id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL REFERENCES merchants(id),
+ message_id TEXT UNIQUE NOT NULL REFERENCES shopping_messages(id), sender TEXT NOT NULL,
+ request TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'NEEDS_REVIEW', created_at TEXT NOT NULL);
 '''
 
 
@@ -42,6 +67,11 @@ class Database:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)
+            # Upgrade installations created before voice worker fencing was added.
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(whatsapp_messages)')}
+            for column in ('claim_token', 'phone_id'):
+                if column not in columns:
+                    db.execute(f'ALTER TABLE whatsapp_messages ADD COLUMN {column} TEXT')
 
     @contextmanager
     def connect(self, write=False):

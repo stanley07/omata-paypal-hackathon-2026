@@ -7,10 +7,11 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from app.config import ROOT, Settings
 from app.db import Database, audit, now
@@ -18,6 +19,9 @@ from app.interpretation import Interpreter
 from app.payments import Payments, owned
 from app.paypal import PayPal
 from app.security import password_hash, password_matches, token_hash
+from app.whatsapp import Speech, VoiceCommerce, WhatsApp
+from app.catalog import seed_catalogs
+from app.shopping import CustomerShopping, GroqIntent
 
 
 class Credentials(BaseModel):
@@ -30,27 +34,34 @@ class Prompt(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
-def create_app(settings=None, paypal=None, interpreter=None):
+def create_app(settings=None, paypal=None, interpreter=None, whatsapp=None, speech=None, shopping_intent=None):
     settings = settings or Settings()
     settings.validate()
     database = Database(settings.database)
     paypal = paypal or PayPal(settings)
     interpreter = interpreter or Interpreter(settings)
     payments = Payments(database, paypal)
+    whatsapp = whatsapp or WhatsApp(settings)
+    voice = VoiceCommerce(database, whatsapp, speech or Speech(settings), interpreter)
+    shopping = CustomerShopping(database, whatsapp, speech or Speech(settings), shopping_intent or GroqIntent(settings), payments)
+    if settings.shopping_enabled:
+        seed_catalogs(database)
 
     @asynccontextmanager
     async def lifespan(app):
         yield
         paypal.client.close()
+        whatsapp.client.close()
 
     app = FastAPI(title='Omata Pay · Sandbox', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.database = database
     app.state.payments = payments
+    app.state.shopping = shopping
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[urlparse(settings.base_url).hostname])
 
     @app.middleware('http')
     async def boundaries(request, call_next):
-        if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.url.path != '/api/webhooks/paypal':
+        if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.url.path not in ('/api/webhooks/paypal', '/api/webhooks/whatsapp'):
             if request.headers.get('origin') != settings.base_url:
                 return JSONResponse({'detail': 'Same-origin request required.'}, status_code=403)
         # Limit streamed payloads too; do not rely only on Content-Length.
@@ -143,13 +154,49 @@ def create_app(settings=None, paypal=None, interpreter=None):
     @app.get('/api/me')
     def me(user=Depends(session)):
         return {'id': user['merchant_id'], 'name': user['name'], 'email': user['email'], 'csrf': user['csrf'],
-                'sandbox': True, 'paypal_enabled': bool(settings.paypal_enabled and settings.client_id and settings.client_secret),
+                'sandbox': True, 'shopping_enabled': settings.shopping_enabled,
+                'paypal_enabled': bool(settings.paypal_enabled and settings.client_id and settings.client_secret),
                 'interpretation': 'Deterministic development parser — not live AI' if settings.ai_provider == 'deterministic' else 'Configured AI provider — live inference only on successful requests'}
 
     @app.get('/api/orders')
     def orders(user=Depends(session)):
         with database.connect() as db:
-            return [dict(r) for r in db.execute('SELECT * FROM orders WHERE merchant_id=? ORDER BY created_at DESC', (user['merchant_id'],))]
+            return [dict(r) for r in db.execute('SELECT o.*,w.transcript,w.sender AS whatsapp_sender,w.share_state AS whatsapp_share_state '
+                'FROM orders o LEFT JOIN whatsapp_messages w ON w.order_id=o.id AND w.merchant_id=o.merchant_id '
+                'WHERE o.merchant_id=? ORDER BY o.created_at DESC', (user['merchant_id'],))]
+
+    @app.get('/api/whatsapp/messages')
+    def voice_messages(user=Depends(session)):
+        with database.connect() as db:
+            return [dict(r) for r in db.execute('SELECT id,sender,received,transcript,order_id,failure,share_state '
+                'FROM whatsapp_messages WHERE merchant_id=? ORDER BY received DESC LIMIT 100', (user['merchant_id'],))]
+
+    @app.get('/api/webhooks/whatsapp')
+    def whatsapp_challenge(request: Request):
+        whatsapp.enabled()
+        query = request.query_params
+        if (query.get('hub.mode') != 'subscribe' or not query.get('hub.challenge') or
+                not secrets.compare_digest(query.get('hub.verify_token', '').encode(), settings.whatsapp_verify_token.encode())):
+            raise HTTPException(403, 'Invalid WhatsApp verification challenge.')
+        return PlainTextResponse(query['hub.challenge'])
+
+    @app.post('/api/webhooks/whatsapp')
+    async def whatsapp_webhook(request: Request):
+        raw = await request.body()
+        whatsapp.verify(raw, request.headers.get('x-hub-signature-256', ''))
+        return await run_in_threadpool(shopping.receive if settings.shopping_enabled else voice.receive, raw)
+
+    @app.get('/api/catalog')
+    def merchant_catalog(user=Depends(session)):
+        with database.connect() as db:
+            return [dict(row) for row in db.execute('SELECT * FROM catalog_products WHERE merchant_id=? ORDER BY name',
+                                                   (user['merchant_id'],))]
+
+    @app.get('/api/shopping/reviews')
+    def shopping_reviews(user=Depends(session)):
+        with database.connect() as db:
+            return [dict(row) for row in db.execute('SELECT * FROM shopping_reviews WHERE merchant_id=? ORDER BY created_at DESC LIMIT 100',
+                                                   (user['merchant_id'],))]
 
     @app.post('/api/orders')
     def draft(body: Prompt, user=Depends(session)):
@@ -167,6 +214,8 @@ def create_app(settings=None, paypal=None, interpreter=None):
         # Ownership is checked even while integrations are disabled.
         with database.connect() as db:
             owned(db, order_id, merchant)
+        if action == 'share-whatsapp':
+            return voice.share(order_id, merchant)
         if action in ('approve', 'reject'):
             with database.connect(write=True) as db:
                 order = owned(db, order_id, merchant)
@@ -228,8 +277,10 @@ def create_app(settings=None, paypal=None, interpreter=None):
     @app.get('/')
     @app.get('/checkout/return')
     @app.get('/checkout/cancel')
-    def index():
+    def index(request: Request):
         # Redirects do not mutate financial state. Merchant explicitly initiates server capture.
+        if settings.shopping_enabled and request.url.path.startswith('/checkout/'):
+            return FileResponse(ROOT / 'app' / 'static' / 'shopping-return.html')
         return FileResponse(ROOT / 'app' / 'static' / 'index.html')
 
     app.mount('/static', StaticFiles(directory=ROOT / 'app' / 'static'), name='static')
